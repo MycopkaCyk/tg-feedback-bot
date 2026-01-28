@@ -1,57 +1,95 @@
 import { Telegraf, Markup } from "telegraf";
 import { createClient } from "@supabase/supabase-js";
 
+/**
+ * ENV переменные в Vercel:
+ * BOT_TOKEN
+ * SUPABASE_URL
+ * SUPABASE_SERVICE_ROLE_KEY
+ * WEBHOOK_SECRET
+ */
+
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-// Supabase клиент
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY,
   { auth: { persistSession: false } }
 );
 
-// Память состояния (MVP). На Vercel может сбрасываться — мы позже перенесём в Supabase.
-const state = new Map(); // userId -> { step, rating, category, lastMessageId }
+/**
+ * MVP state in memory (на Vercel может иногда сбрасываться).
+ * Структура на пользователя:
+ * {
+ *   step: "WAIT_DIRECTION" | "WAIT_COMMENT" | "WAIT_USEFULNESS" | "WAIT_USABILITY" | "DONE",
+ *   direction: string|null,
+ *   comment: string|null,
+ *   usefulness: number|null,
+ *   usability: number|null,
+ *   lastMessageId: number|null
+ * }
+ */
+const state = new Map();
 
-function kbRating() {
-  return Markup.inlineKeyboard([
-    [1, 2, 3, 4, 5].map((n) => Markup.button.callback(`⭐ ${n}`, `rate:${n}`))
-  ]);
+const TEXT = {
+  hello:
+    "Привет! Я соберу обратную связь по приложению.\n\nВыберите, что хотите отправить:",
+  askComment: "Напишите ваш комментарий одним сообщением:",
+  askUsefulness: "Оцените полезность приложения по шкале 1–5:",
+  askUsability: "Оцените удобство приложения по шкале 1–5:",
+  saved: "Спасибо! Отзыв сохранён.",
+  closed: "Диалог завершён. Чтобы оставить отзыв снова — /start",
+  saveError: (code) =>
+    `Ошибка сохранения (код: ${code ?? "unknown"}). Попробуйте ещё раз позже.`,
+};
+
+const DIRECTIONS = [
+  { label: "🐞 Сообщить о ошибке", code: "BUG" },
+  { label: "✨ Предложить идею", code: "FEATURE" },
+  { label: "💬 Общий отзыв", code: "FEEDBACK" },
+  { label: "❓ Вопрос/поддержка", code: "SUPPORT" },
+];
+
+function kbDirection() {
+  return Markup.inlineKeyboard(
+    DIRECTIONS.map((d) => [Markup.button.callback(d.label, `dir:${d.code}`)])
+  );
 }
 
-function kbCategory() {
+function kbRating(prefix) {
   return Markup.inlineKeyboard([
-    [
-      Markup.button.callback("🎨 UI", "cat:UI"),
-      Markup.button.callback("🐞 Баг", "cat:BUG")
-    ],
-    [
-      Markup.button.callback("✨ Фича", "cat:FEATURE"),
-      Markup.button.callback("⚡ Скорость", "cat:PERF")
-    ],
-    [Markup.button.callback("📌 Другое", "cat:OTHER")]
+    [1, 2, 3, 4, 5].map((n) =>
+      Markup.button.callback(`⭐ ${n}`, `${prefix}:${n}`)
+    ),
   ]);
 }
 
 function kbDone() {
   return Markup.inlineKeyboard([
     [Markup.button.callback("➕ Оставить ещё", "done:again")],
-    [Markup.button.callback("✅ Закрыть", "done:finish")]
+    [Markup.button.callback("✅ Закрыть", "done:finish")],
   ]);
 }
 
-// Помощник: редактировать “главное” сообщение (один экран)
+/**
+ * Основной UX: 1 "главное" сообщение, которое редактируем.
+ */
 async function editOrSend(ctx, userId, text, extra) {
   const st = state.get(userId) || {};
   const chatId = ctx.chat?.id || ctx.update?.callback_query?.message?.chat?.id;
 
-  // пробуем редактировать существующее “главное” сообщение
   if (st.lastMessageId && chatId) {
     try {
-      await ctx.telegram.editMessageText(chatId, st.lastMessageId, undefined, text, extra);
+      await ctx.telegram.editMessageText(
+        chatId,
+        st.lastMessageId,
+        undefined,
+        text,
+        extra
+      );
       return;
-    } catch (e) {
-      // если не вышло (сообщение удалено/старое) — отправим новое
+    } catch {
+      // если нельзя отредактировать — отправим новое
     }
   }
 
@@ -59,113 +97,171 @@ async function editOrSend(ctx, userId, text, extra) {
   state.set(userId, { ...st, lastMessageId: msg.message_id });
 }
 
+function resetUser(userId) {
+  const prev = state.get(userId) || {};
+  state.set(userId, {
+    step: "WAIT_DIRECTION",
+    direction: null,
+    comment: null,
+    usefulness: null,
+    usability: null,
+    lastMessageId: prev.lastMessageId ?? null,
+  });
+}
+
 bot.start(async (ctx) => {
   const userId = ctx.from.id;
-  state.set(userId, { step: "WAIT_RATING", rating: null, category: null, lastMessageId: state.get(userId)?.lastMessageId });
-  await editOrSend(ctx, userId, "Оцените приложение по шкале 1–5:", kbRating());
+  resetUser(userId);
+  await editOrSend(ctx, userId, TEXT.hello, kbDirection());
 });
 
-bot.action(/^rate:(\d)$/, async (ctx) => {
+/**
+ * Выбор направления
+ */
+bot.action(/^dir:(BUG|FEATURE|FEEDBACK|SUPPORT)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from.id;
-  const rating = Number(ctx.match[1]);
+  const dir = ctx.match[1];
 
   const st = state.get(userId) || {};
-  state.set(userId, { ...st, step: "WAIT_CATEGORY", rating });
+  state.set(userId, { ...st, step: "WAIT_COMMENT", direction: dir });
 
-  await editOrSend(ctx, userId, "Выберите категорию обратной связи:", kbCategory());
+  await editOrSend(ctx, userId, TEXT.askComment, {
+    reply_markup: { inline_keyboard: [] },
+  });
 });
 
-bot.action(/^cat:(UI|BUG|FEATURE|PERF|OTHER)$/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const userId = ctx.from.id;
-  const category = ctx.match[1];
-
-  const st = state.get(userId) || {};
-  state.set(userId, { ...st, step: "WAIT_COMMENT", category });
-
-  await editOrSend(ctx, userId, "Напишите комментарий одним сообщением:", { reply_markup: { inline_keyboard: [] } });
-});
-
+/**
+ * Пользователь пишет комментарий (текст)
+ */
 bot.on("text", async (ctx) => {
   const userId = ctx.from.id;
   const st = state.get(userId);
 
-  // если не на шаге комментария — игнор
   if (!st || st.step !== "WAIT_COMMENT") return;
 
   const comment = ctx.message.text.trim();
   if (!comment) return;
 
-  // сохраняем в Supabase
-  const { data, error } = await supabase
-  .from("mYfeedbek")
-  .insert({
-    tg_user_id: userId,
-    tg_username: ctx.from.username ?? null,
-    rating: st.rating,
-    category: st.category,
-    comment
-  })
-  .select()
-  .single();
+  state.set(userId, { ...st, comment, step: "WAIT_USEFULNESS" });
 
-if (error) {
-  console.error("SUPABASE INSERT ERROR:", {
-    message: error.message,
-    details: error.details,
-    hint: error.hint,
-    code: error.code
-  });
-
-  await editOrSend(
-    ctx,
-    userId,
-    `Ошибка сохранения (код: ${error.code ?? "unknown"}). Попробуйте ещё раз позже.`,
-    { reply_markup: { inline_keyboard: [] } }
-  );
-  return;
-}
-
-console.log("Saved feedback id:", data?.id);
-
-  // сбрасываем состояние на DONE
-  state.set(userId, { ...st, step: "DONE", rating: null, category: null });
-
-  await editOrSend(ctx, userId, "Спасибо! Обратная связь сохранена.", kbDone());
+  await editOrSend(ctx, userId, TEXT.askUsefulness, kbRating("useful"));
 });
 
-bot.action(/^done:(again|finish)$/, async (ctx) => {
+/**
+ * Оценка полезности
+ */
+bot.action(/^useful:(\d)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from.id;
-  const st = state.get(userId) || {};
+  const val = Number(ctx.match[1]);
 
-  if (ctx.match[1] === "again") {
-    state.set(userId, { ...st, step: "WAIT_RATING", rating: null, category: null });
-    await editOrSend(ctx, userId, "Оцените приложение по шкале 1–5:", kbRating());
+  const st = state.get(userId);
+  if (!st || st.step !== "WAIT_USEFULNESS") return;
+
+  state.set(userId, { ...st, usefulness: val, step: "WAIT_USABILITY" });
+
+  await editOrSend(ctx, userId, TEXT.askUsability, kbRating("usable"));
+});
+
+/**
+ * Оценка удобства + сохранение в Supabase
+ */
+bot.action(/^usable:(\d)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from.id;
+  const val = Number(ctx.match[1]);
+
+  const st = state.get(userId);
+  if (!st || st.step !== "WAIT_USABILITY") return;
+
+  // защита от пустых данных
+  if (!st.direction || !st.comment || !st.usefulness) {
+    resetUser(userId);
+    await editOrSend(ctx, userId, TEXT.hello, kbDirection());
     return;
   }
 
-  state.set(userId, { ...st, step: "DONE", rating: null, category: null });
-  await editOrSend(ctx, userId, "Диалог завершён. Чтобы оставить отзыв снова — /start", { reply_markup: { inline_keyboard: [] } });
+  const payload = {
+    tg_user_id: userId,
+    tg_username: ctx.from.username ?? null,
+    category: st.direction, // в базе можно потом переименовать в direction
+    comment: st.comment,
+    rating_usefulness: st.usefulness,
+    rating_usability: val,
+  };
+
+  const { data, error } = await supabase
+    .from("feedback")
+    .insert(payload)
+    .select()
+    .single();
+
+  if (error) {
+    console.error("SUPABASE INSERT ERROR:", {
+      message: error.message,
+      details: error.details,
+      hint: error.hint,
+      code: error.code,
+    });
+
+    await editOrSend(
+      ctx,
+      userId,
+      TEXT.saveError(error.code),
+      { reply_markup: { inline_keyboard: [] } }
+    );
+    return;
+  }
+
+  state.set(userId, { ...st, step: "DONE", usability: val });
+
+  console.log("Saved feedback id:", data?.id);
+  await editOrSend(ctx, userId, TEXT.saved, kbDone());
 });
 
-// Vercel handler
+/**
+ * Завершение или новый отзыв
+ */
+bot.action(/^done:(again|finish)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from.id;
+
+  if (ctx.match[1] === "again") {
+    resetUser(userId);
+    await editOrSend(ctx, userId, TEXT.hello, kbDirection());
+    return;
+  }
+
+  const st = state.get(userId) || {};
+  state.set(userId, { ...st, step: "DONE" });
+
+  await editOrSend(ctx, userId, TEXT.closed, {
+    reply_markup: { inline_keyboard: [] },
+  });
+});
+
+/**
+ * Vercel handler (webhook endpoint)
+ */
 export default async function handler(req, res) {
-  // 1) проверяем секрет от Telegram (позже настроим setWebhook с secret_token)
+  // Telegram присылает секрет вот в этом заголовке (если setWebhook был с secret_token)
   const secret = req.headers["x-telegram-bot-api-secret-token"];
   if (secret !== process.env.WEBHOOK_SECRET) {
     res.status(401).send("unauthorized");
     return;
   }
 
-  // 2) Telegram шлёт POST
   if (req.method !== "POST") {
     res.status(200).send("ok");
     return;
   }
 
-  // 3) передаём update боту
-  await bot.handleUpdate(req.body);
+  try {
+    await bot.handleUpdate(req.body);
+  } catch (e) {
+    console.error("BOT HANDLE UPDATE ERROR:", e);
+  }
+
   res.status(200).send("ok");
 }
