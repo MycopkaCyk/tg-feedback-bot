@@ -99,7 +99,7 @@ bot.on("text", async (ctx) => {
 
   // сохраняем в Supabase
   const { data, error } = await supabase
-  .from("feedback")
+  .from("mYfeedbek")
   .insert({
     tg_user_id: userId,
     tg_username: ctx.from.username ?? null,
