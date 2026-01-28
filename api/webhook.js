@@ -98,18 +98,36 @@ bot.on("text", async (ctx) => {
   if (!comment) return;
 
   // сохраняем в Supabase
-  const { error } = await supabase.from("feedback").insert({
+  const { data, error } = await supabase
+  .from("feedback")
+  .insert({
     tg_user_id: userId,
     tg_username: ctx.from.username ?? null,
     rating: st.rating,
     category: st.category,
     comment
+  })
+  .select()
+  .single();
+
+if (error) {
+  console.error("SUPABASE INSERT ERROR:", {
+    message: error.message,
+    details: error.details,
+    hint: error.hint,
+    code: error.code
   });
 
-  if (error) {
-    await editOrSend(ctx, userId, "Ошибка сохранения. Попробуйте ещё раз позже.", { reply_markup: { inline_keyboard: [] } });
-    return;
-  }
+  await editOrSend(
+    ctx,
+    userId,
+    `Ошибка сохранения (код: ${error.code ?? "unknown"}). Попробуйте ещё раз позже.`,
+    { reply_markup: { inline_keyboard: [] } }
+  );
+  return;
+}
+
+console.log("Saved feedback id:", data?.id);
 
   // сбрасываем состояние на DONE
   state.set(userId, { ...st, step: "DONE", rating: null, category: null });
