@@ -192,7 +192,7 @@ bot.action(/^usable:(\d)$/, async (ctx) => {
   };
 
   const { data, error } = await supabase
-    .from("feedback")
+    .from("mYfeedbek")
     .insert(payload)
     .select()
     .single();
