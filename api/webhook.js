@@ -1,8 +1,27 @@
-// api/webhook.js (ПОЛНАЯ рабочая версия)
-// Функции: меню -> текст -> 2 оценки -> сохранение -> финальная отбивка
-// + follow-up при avg<=3 (4.1)
-// + контакт по желанию (5.1): Telegram / Email / Не нужно
-// Таблица: public."mYfeedbek"
+// api/webhook.js (ПОЛНАЯ версия: всё, что было раньше + благодарность с причинами + опциональный текст)
+//
+// Требования к таблице public."mYfeedbek" (Supabase):
+// - id (uuid, default gen_random_uuid())
+// - created_at (timestamptz, default now())
+// - tg_user_id (bigint)
+// - tg_username (text)
+// - category (text)                       // REVIEW / BUG / IDEA / THANKS
+// - comment (text)                        // основной текст (или текст благодарности, если CUSTOM)
+// - rating_usefulness (smallint)          // только для REVIEW/BUG/IDEA
+// - rating_usability (smallint)           // только для REVIEW/BUG/IDEA
+// - followup_comment (text)               // уточнение при низких оценках (опционально)
+// - contact_type (text)                   // TG / EMAIL / NONE (опционально)
+// - contact_value (text)                  // @username/email/userId (опционально)
+// - thanks_reason (text)                  // SPEED/UX/IDEA/LOGIC/LIKE/CUSTOM (для THANKS)
+//
+// Переменные окружения в Vercel:
+// BOT_TOKEN
+// SUPABASE_URL
+// SUPABASE_SERVICE_ROLE_KEY
+// WEBHOOK_SECRET
+//
+// Тексты вынесены в ../texts.js (в корне проекта рядом с package.json):
+// export const TEXT, FINAL, TOPIC_LABEL
 
 import { Telegraf, Markup } from "telegraf";
 import { createClient } from "@supabase/supabase-js";
@@ -16,18 +35,30 @@ const supabase = createClient(
   { auth: { persistSession: false } }
 );
 
-const state = new Map();
 /**
+ * State in memory (MVP).
  * userId -> {
- *   step: "MENU" | "WAIT_TEXT" | "WAIT_USEFULNESS" | "WAIT_USABILITY" | "WAIT_FOLLOWUP" | "WAIT_EMAIL",
- *   topic: "REVIEW" | "BUG" | "IDEA" | null,
+ *   step:
+ *     "MENU"
+ *     | "WAIT_TEXT"
+ *     | "WAIT_USEFULNESS"
+ *     | "WAIT_USABILITY"
+ *     | "WAIT_FOLLOWUP"
+ *     | "WAIT_EMAIL"
+ *     | "THANKS_REASON"
+ *     | "THANKS_TEXT",
+ *   topic: "REVIEW" | "BUG" | "IDEA" | "THANKS" | null,
  *   comment: string|null,
  *   usefulness: number|null,
- *   lastFeedbackId: string|null
+ *   lastFeedbackId: string|null,
+ *   thanks_reason: string|null
  * }
  */
+const state = new Map();
 
-/* ---------- UI ---------- */
+/* =========================
+   UI (Кнопки)
+========================= */
 
 function kbMenu() {
   return Markup.inlineKeyboard([
@@ -42,7 +73,7 @@ function kbBackToMenu() {
   return Markup.inlineKeyboard([[Markup.button.callback("⬅️ В меню", "nav:MENU")]]);
 }
 
-function kbAfterSavedBase() {
+function kbAfterSaved() {
   return Markup.inlineKeyboard([
     [Markup.button.callback("➕ Отправить ещё", "nav:MENU")],
     [Markup.button.callback("✅ Закрыть", "nav:CLOSE")],
@@ -81,17 +112,39 @@ function kbChips(topic) {
   ]);
 }
 
-/* ---------- Helpers ---------- */
+function kbThanksReasons() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback("🚀 Скорость", "th:SPEED"),
+      Markup.button.callback("🎯 Удобство", "th:UX"),
+    ],
+    [
+      Markup.button.callback("💡 Идея / подход", "th:IDEA"),
+      Markup.button.callback("🧠 Логика", "th:LOGIC"),
+    ],
+    [
+      Markup.button.callback("❤️ Просто нравится", "th:LIKE"),
+      Markup.button.callback("✍️ Написать пару слов", "th:CUSTOM"),
+    ],
+    [Markup.button.callback("⬅️ В меню", "nav:MENU")],
+  ]);
+}
+
+/* =========================
+   Helpers (typing / state / text)
+========================= */
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Динамическая задержка: длина текста * 12мс, clamp 500..1300
 function calcDelayMs(text) {
   const ms = Math.round(String(text ?? "").length * 12);
   return Math.max(500, Math.min(1300, ms));
 }
 
+// Плавная отправка: typing -> "Печатает…" -> пауза -> удалить -> финал
 async function sendTypingThen(ctx, finalText, extra = undefined) {
   const safeTyping = TEXT?.typing ?? "Печатает…";
   const safeText = String(finalText ?? "");
@@ -124,6 +177,7 @@ function setState(userId, patch) {
     comment: null,
     usefulness: null,
     lastFeedbackId: null,
+    thanks_reason: null,
   };
   state.set(userId, { ...prev, ...patch });
 }
@@ -135,11 +189,18 @@ function resetToMenu(userId) {
     comment: null,
     usefulness: null,
     lastFeedbackId: null,
+    thanks_reason: null,
   });
 }
 
 function pickRandom(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function isLikelyEmail(text) {
+  const s = String(text || "").trim();
+  if (s.length < 6 || s.length > 254) return false;
+  return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(s);
 }
 
 function scoreAvg(usefulness, usability) {
@@ -182,20 +243,17 @@ function buildFinalMessage(topic, comment, usefulness, usability) {
   return `${header}\n\n${ratings}\n\n${tail}${short}`;
 }
 
-function isLikelyEmail(text) {
-  const s = String(text || "").trim();
-  if (s.length < 6 || s.length > 254) return false;
-  // простой и устойчивый regex
-  return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(s);
-}
+/* =========================
+   FLOW
+========================= */
 
-/* ---------- Flow ---------- */
-
+// /start
 bot.start(async (ctx) => {
   resetToMenu(ctx.from.id);
   await sendTypingThen(ctx, TEXT.greeting, kbMenu());
 });
 
+// Навигация
 bot.action(/^nav:(MENU|CLOSE)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from.id;
@@ -210,14 +268,15 @@ bot.action(/^nav:(MENU|CLOSE)$/, async (ctx) => {
   await sendTypingThen(ctx, TEXT.close, { reply_markup: { inline_keyboard: [] } });
 });
 
+// Меню: ветвление
 bot.action(/^menu:(THANKS|REVIEW|BUG|IDEA)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from.id;
   const choice = ctx.match[1];
 
   if (choice === "THANKS") {
-    resetToMenu(userId);
-    await sendTypingThen(ctx, TEXT.gratitudeReply, kbBackToMenu());
+    setState(userId, { step: "THANKS_REASON", topic: "THANKS", thanks_reason: null });
+    await sendTypingThen(ctx, "Спасибо! Если коротко — за что именно?", kbThanksReasons());
     return;
   }
 
@@ -240,6 +299,58 @@ bot.action(/^menu:(THANKS|REVIEW|BUG|IDEA)$/, async (ctx) => {
   }
 });
 
+// THANKS: выбор причины
+bot.action(/^th:(SPEED|UX|IDEA|LOGIC|LIKE|CUSTOM)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from.id;
+  const reason = ctx.match[1];
+
+  // Если пользователь ушёл в меню — сбрасываем
+  const st = state.get(userId);
+  if (!st || st.step !== "THANKS_REASON") {
+    resetToMenu(userId);
+    await sendTypingThen(ctx, TEXT.greeting, kbMenu());
+    return;
+  }
+
+  if (reason === "CUSTOM") {
+    setState(userId, { step: "THANKS_TEXT", topic: "THANKS", thanks_reason: "CUSTOM" });
+    await sendTypingThen(
+      ctx,
+      "Хочешь — напиши пару слов. Это необязательно, но нам будет приятно 🙂",
+      kbBackToMenu()
+    );
+    return;
+  }
+
+  // Сохраняем благодарность (структурно)
+  const { error } = await supabase.from("mYfeedbek").insert({
+    tg_user_id: userId,
+    tg_username: ctx.from.username ?? null,
+    category: "THANKS",
+    thanks_reason: reason,
+    comment: null,
+    rating_usefulness: null,
+    rating_usability: null,
+  });
+
+  if (error) {
+    console.error("SUPABASE THANKS INSERT ERROR:", {
+      message: error.message,
+      details: error.details,
+      hint: error.hint,
+      code: error.code,
+    });
+    resetToMenu(userId);
+    await sendTypingThen(ctx, TEXT.saveError ? TEXT.saveError(error.code) : `Ошибка сохранения (код: ${error.code ?? "unknown"}).`, kbBackToMenu());
+    return;
+  }
+
+  resetToMenu(userId);
+  await sendTypingThen(ctx, "Спасибо! Мы это ценим 🙏", kbAfterSaved());
+});
+
+// Chips: выдаём инструкцию и просим написать текст
 bot.action(/^chip:(REVIEW|BUG|IDEA):(SHORT|TEMPLATE|DETAILED)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from.id;
@@ -272,12 +383,46 @@ bot.action(/^chip:(REVIEW|BUG|IDEA):(SHORT|TEMPLATE|DETAILED)$/, async (ctx) => 
   await sendTypingThen(ctx, `${guide}\n\n${TEXT.askWrite}`, kbBackToMenu());
 });
 
+// Text handler: принимает либо THANKS_TEXT / FOLLOWUP / EMAIL / основной текст
 bot.on("text", async (ctx) => {
   const userId = ctx.from.id;
   const st = state.get(userId);
+  if (!st) return;
 
-  // 1) Email ожидание
-  if (st && st.step === "WAIT_EMAIL" && st.lastFeedbackId) {
+  // 1) THANKS_TEXT: пользователь пишет пару слов благодарности
+  if (st.step === "THANKS_TEXT") {
+    const t = ctx.message.text.trim();
+    if (!t) return;
+
+    const { error } = await supabase.from("mYfeedbek").insert({
+      tg_user_id: userId,
+      tg_username: ctx.from.username ?? null,
+      category: "THANKS",
+      thanks_reason: st.thanks_reason ?? "CUSTOM",
+      comment: t,
+      rating_usefulness: null,
+      rating_usability: null,
+    });
+
+    if (error) {
+      console.error("SUPABASE THANKS CUSTOM INSERT ERROR:", {
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+        code: error.code,
+      });
+      resetToMenu(userId);
+      await sendTypingThen(ctx, `Ошибка сохранения (код: ${error.code ?? "unknown"}).`, kbBackToMenu());
+      return;
+    }
+
+    resetToMenu(userId);
+    await sendTypingThen(ctx, "Спасибо за тёплые слова! Это правда важно.", kbAfterSaved());
+    return;
+  }
+
+  // 2) WAIT_EMAIL: пользователь вводит email для контакта
+  if (st.step === "WAIT_EMAIL" && st.lastFeedbackId) {
     const email = ctx.message.text.trim();
 
     if (!isLikelyEmail(email)) {
@@ -295,19 +440,23 @@ bot.on("text", async (ctx) => {
       .eq("id", st.lastFeedbackId);
 
     if (error) {
-      console.error("SUPABASE CONTACT EMAIL UPDATE ERROR:", error);
+      console.error("SUPABASE CONTACT EMAIL UPDATE ERROR:", {
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+        code: error.code,
+      });
       await sendTypingThen(ctx, `Ошибка сохранения (код: ${error.code ?? "unknown"}).`, kbBackToMenu());
       return;
     }
 
-    // После email — завершаем
     resetToMenu(userId);
-    await sendTypingThen(ctx, "Спасибо! Контакт сохранён. Мы можем ответить при необходимости.", kbAfterSavedBase());
+    await sendTypingThen(ctx, "Спасибо! Контакт сохранён. Мы можем ответить при необходимости.", kbAfterSaved());
     return;
   }
 
-  // 2) Follow-up ожидание
-  if (st && st.step === "WAIT_FOLLOWUP" && st.lastFeedbackId) {
+  // 3) WAIT_FOLLOWUP: уточнение при низких оценках
+  if (st.step === "WAIT_FOLLOWUP" && st.lastFeedbackId) {
     const follow = ctx.message.text.trim();
     if (!follow) return;
 
@@ -317,28 +466,36 @@ bot.on("text", async (ctx) => {
       .eq("id", st.lastFeedbackId);
 
     if (error) {
-      console.error("SUPABASE FOLLOWUP UPDATE ERROR:", error);
+      console.error("SUPABASE FOLLOWUP UPDATE ERROR:", {
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+        code: error.code,
+      });
       await sendTypingThen(ctx, `Ошибка сохранения (код: ${error.code ?? "unknown"}).`, kbBackToMenu());
       return;
     }
 
-    // После follow-up — предлагаем контакт
+    // После уточнения — предлагаем контакт (5.1)
     setState(userId, { step: "MENU" });
-    await sendTypingThen(ctx, "Спасибо! Уточнение добавлено.\n\nОставить контакт для ответа?", kbContactChoice());
+    await sendTypingThen(ctx, "Спасибо! Уточнение добавлено.\n\nОставить контакт для ответа (по желанию)?", kbContactChoice());
     return;
   }
 
-  // 3) Основной текст
-  if (!st || st.step !== "WAIT_TEXT" || !st.topic) return;
+  // 4) WAIT_TEXT: основной текст (REVIEW/BUG/IDEA)
+  if (st.step === "WAIT_TEXT" && st.topic && st.topic !== "THANKS") {
+    const comment = ctx.message.text.trim();
+    if (!comment) return;
 
-  const comment = ctx.message.text.trim();
-  if (!comment) return;
+    setState(userId, { step: "WAIT_USEFULNESS", comment });
+    await sendTypingThen(ctx, TEXT.askUsefulness, kbRating("useful"));
+    return;
+  }
 
-  setState(userId, { step: "WAIT_USEFULNESS", comment });
-
-  await sendTypingThen(ctx, TEXT.askUsefulness, kbRating("useful"));
+  // Всё прочее игнорируем
 });
 
+// Полезность
 bot.action(/^useful:(\d)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from.id;
@@ -346,12 +503,12 @@ bot.action(/^useful:(\d)$/, async (ctx) => {
   if (!st || st.step !== "WAIT_USEFULNESS") return;
 
   const val = Number(ctx.match[1]);
-
   setState(userId, { step: "WAIT_USABILITY", usefulness: val });
 
   await sendTypingThen(ctx, TEXT.askUsability, kbRating("usable"));
 });
 
+// Удобство + сохранение REVIEW/BUG/IDEA + финал + follow-up + контакт
 bot.action(/^usable:(\d)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from.id;
@@ -360,7 +517,7 @@ bot.action(/^usable:(\d)$/, async (ctx) => {
 
   const usability = Number(ctx.match[1]);
 
-  if (!st.topic || !st.comment || !st.usefulness) {
+  if (!st.topic || st.topic === "THANKS" || !st.comment || !st.usefulness) {
     resetToMenu(userId);
     await sendTypingThen(ctx, TEXT.greeting, kbMenu());
     return;
@@ -369,10 +526,11 @@ bot.action(/^usable:(\d)$/, async (ctx) => {
   const payload = {
     tg_user_id: userId,
     tg_username: ctx.from.username ?? null,
-    category: st.topic,
+    category: st.topic, // REVIEW/BUG/IDEA
     comment: st.comment,
     rating_usefulness: st.usefulness,
     rating_usability: usability,
+    thanks_reason: null,
   };
 
   const { data, error } = await supabase
@@ -392,16 +550,16 @@ bot.action(/^usable:(\d)$/, async (ctx) => {
     return;
   }
 
+  // Сохраняем id последней записи для follow-up и контакта
   const feedbackId = data?.id ?? null;
   setState(userId, { lastFeedbackId: feedbackId });
 
+  // 1) Финальная отбивка (по оценкам)
   const msg = buildFinalMessage(st.topic, st.comment, st.usefulness, usability);
-  const avg = scoreAvg(st.usefulness, usability);
-
-  // 1) Показываем финальную отбивку
   await sendTypingThen(ctx, msg, { reply_markup: { inline_keyboard: [] } });
 
-  // 2) Если низко/средне — предлагаем уточнение, потом контакт
+  // 2) Follow-up при avg<=3 (4.1)
+  const avg = scoreAvg(st.usefulness, usability);
   if (avg <= 3) {
     setState(userId, { step: "MENU" });
     await sendTypingThen(
@@ -412,11 +570,12 @@ bot.action(/^usable:(\d)$/, async (ctx) => {
     return;
   }
 
-  // 3) Если 4–5 — сразу спрашиваем контакт (по желанию)
+  // 3) Если оценка высокая — сразу контакт (5.1)
   setState(userId, { step: "MENU" });
   await sendTypingThen(ctx, "Оставить контакт для ответа (по желанию)?", kbContactChoice());
 });
 
+// Follow-up choice
 bot.action(/^fu:(yes|no)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from.id;
@@ -429,7 +588,7 @@ bot.action(/^fu:(yes|no)$/, async (ctx) => {
   }
 
   if (ctx.match[1] === "no") {
-    // Если не хочет уточнять — спрашиваем контакт
+    // Не хочет уточнять -> контакт (по желанию)
     setState(userId, { step: "MENU" });
     await sendTypingThen(ctx, "Оставить контакт для ответа (по желанию)?", kbContactChoice());
     return;
@@ -443,6 +602,7 @@ bot.action(/^fu:(yes|no)$/, async (ctx) => {
   );
 });
 
+// Contact choice (5.1)
 bot.action(/^ct:(TG|EMAIL|NONE)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from.id;
@@ -458,7 +618,7 @@ bot.action(/^ct:(TG|EMAIL|NONE)$/, async (ctx) => {
 
   if (choice === "NONE") {
     resetToMenu(userId);
-    await sendTypingThen(ctx, "Принято. Спасибо!", kbAfterSavedBase());
+    await sendTypingThen(ctx, "Принято. Спасибо!", kbAfterSaved());
     return;
   }
 
@@ -474,7 +634,12 @@ bot.action(/^ct:(TG|EMAIL|NONE)$/, async (ctx) => {
       .eq("id", st.lastFeedbackId);
 
     if (error) {
-      console.error("SUPABASE CONTACT TG UPDATE ERROR:", error);
+      console.error("SUPABASE CONTACT TG UPDATE ERROR:", {
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+        code: error.code,
+      });
       await sendTypingThen(ctx, `Ошибка сохранения (код: ${error.code ?? "unknown"}).`, kbBackToMenu());
       return;
     }
@@ -482,24 +647,20 @@ bot.action(/^ct:(TG|EMAIL|NONE)$/, async (ctx) => {
     resetToMenu(userId);
     await sendTypingThen(
       ctx,
-      username
-        ? `Контакт сохранён: ${username}\nСпасибо!`
-        : "Контакт сохранён. Спасибо!",
-      kbAfterSavedBase()
+      username ? `Контакт сохранён: ${username}\nСпасибо!` : "Контакт сохранён. Спасибо!",
+      kbAfterSaved()
     );
     return;
   }
 
   // EMAIL
   setState(userId, { step: "WAIT_EMAIL" });
-  await sendTypingThen(
-    ctx,
-    "Напиши email одним сообщением (пример: name@example.com).",
-    kbBackToMenu()
-  );
+  await sendTypingThen(ctx, "Напиши email одним сообщением (пример: name@example.com).", kbBackToMenu());
 });
 
-/* ---------- Vercel handler ---------- */
+/* =========================
+   Vercel handler
+========================= */
 
 export default async function handler(req, res) {
   const secret = req.headers["x-telegram-bot-api-secret-token"];
