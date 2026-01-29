@@ -1,4 +1,3 @@
-// api/webhook.js  (оставь в папке /api)
 import { Telegraf, Markup } from "telegraf";
 import { createClient } from "@supabase/supabase-js";
 import { TEXT, FINAL, TOPIC_LABEL } from "../texts.js";
@@ -11,16 +10,16 @@ const supabase = createClient(
   { auth: { persistSession: false } }
 );
 
+const state = new Map();
 /**
- * State in memory (MVP)
  * userId -> {
- *   step: "MENU" | "WAIT_TEXT" | "WAIT_USEFULNESS" | "WAIT_USABILITY",
+ *   step: "MENU" | "WAIT_TEXT" | "WAIT_USEFULNESS" | "WAIT_USABILITY" | "WAIT_FOLLOWUP",
  *   topic: "REVIEW" | "BUG" | "IDEA" | null,
  *   comment: string|null,
- *   usefulness: number|null
+ *   usefulness: number|null,
+ *   lastFeedbackId: string|null
  * }
  */
-const state = new Map();
 
 /* ---------- UI ---------- */
 
@@ -39,6 +38,15 @@ function kbBackToMenu() {
 
 function kbAfterSaved() {
   return Markup.inlineKeyboard([
+    [Markup.button.callback("➕ Отправить ещё", "nav:MENU")],
+    [Markup.button.callback("✅ Закрыть", "nav:CLOSE")],
+  ]);
+}
+
+function kbAfterSavedWithFollowup() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("🛠 Уточнить, что не так", "fu:yes")],
+    [Markup.button.callback("Нет, спасибо", "fu:no")],
     [Markup.button.callback("➕ Отправить ещё", "nav:MENU")],
     [Markup.button.callback("✅ Закрыть", "nav:CLOSE")],
   ]);
@@ -103,20 +111,31 @@ function setState(userId, patch) {
     topic: null,
     comment: null,
     usefulness: null,
+    lastFeedbackId: null,
   };
   state.set(userId, { ...prev, ...patch });
 }
 
 function resetToMenu(userId) {
-  setState(userId, { step: "MENU", topic: null, comment: null, usefulness: null });
+  setState(userId, {
+    step: "MENU",
+    topic: null,
+    comment: null,
+    usefulness: null,
+    lastFeedbackId: null,
+  });
 }
 
 function pickRandom(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
+function scoreAvg(usefulness, usability) {
+  return (usefulness + usability) / 2;
+}
+
 function scoreBucket(usefulness, usability) {
-  const avg = (usefulness + usability) / 2;
+  const avg = scoreAvg(usefulness, usability);
   if (avg >= 4) return "high";
   if (avg >= 3) return "mid";
   return "low";
@@ -136,15 +155,16 @@ function buildFinalMessage(topic, comment, usefulness, usability) {
 
   const bucket = scoreBucket(usefulness, usability);
   const pool =
-    bucket === "high" ? FINAL?.high :
-    bucket === "mid" ? FINAL?.mid :
-    FINAL?.low;
+    bucket === "high" ? FINAL?.high : bucket === "mid" ? FINAL?.mid : FINAL?.low;
 
-  const tail = Array.isArray(pool) && pool.length ? pickRandom(pool) : "Спасибо за обратную связь.";
+  const tail =
+    Array.isArray(pool) && pool.length ? pickRandom(pool) : "Спасибо за обратную связь.";
 
   const short =
     comment && String(comment).trim().length
-      ? `\n\n📝 Сообщение:\n${String(comment).slice(0, 600)}${String(comment).length > 600 ? "…" : ""}`
+      ? `\n\n📝 Сообщение:\n${String(comment).slice(0, 600)}${
+          String(comment).length > 600 ? "…" : ""
+        }`
       : "";
 
   return `${header}\n\n${ratings}\n\n${tail}${short}`;
@@ -237,6 +257,29 @@ bot.on("text", async (ctx) => {
   const userId = ctx.from.id;
   const st = state.get(userId);
 
+  // Follow-up text
+  if (st && st.step === "WAIT_FOLLOWUP" && st.lastFeedbackId) {
+    const follow = ctx.message.text.trim();
+    if (!follow) return;
+
+    const { error } = await supabase
+      .from("mYfeedbek")
+      .update({ followup_comment: follow })
+      .eq("id", st.lastFeedbackId);
+
+    if (error) {
+      console.error("SUPABASE FOLLOWUP UPDATE ERROR:", error);
+      await sendTypingThen(ctx, `Ошибка сохранения (код: ${error.code ?? "unknown"}).`, kbBackToMenu());
+      return;
+    }
+
+    // после уточнения — возвращаем в меню
+    resetToMenu(userId);
+    await sendTypingThen(ctx, "Спасибо! Уточнение добавлено.", kbAfterSaved());
+    return;
+  }
+
+  // Main text
   if (!st || st.step !== "WAIT_TEXT" || !st.topic) return;
 
   const comment = ctx.message.text.trim();
@@ -277,13 +320,12 @@ bot.action(/^usable:(\d)$/, async (ctx) => {
   const payload = {
     tg_user_id: userId,
     tg_username: ctx.from.username ?? null,
-    category: st.topic, // REVIEW/BUG/IDEA
+    category: st.topic,
     comment: st.comment,
     rating_usefulness: st.usefulness,
     rating_usability: usability,
   };
 
-  // ВАЖНО: таблица с твоим регистром
   const { data, error } = await supabase
     .from("mYfeedbek")
     .insert(payload)
@@ -301,12 +343,44 @@ bot.action(/^usable:(\d)$/, async (ctx) => {
     return;
   }
 
-  console.log("Saved feedback id:", data?.id);
-
   const msg = buildFinalMessage(st.topic, st.comment, st.usefulness, usability);
+  const avg = scoreAvg(st.usefulness, usability);
 
-  resetToMenu(userId);
-  await sendTypingThen(ctx, msg, kbAfterSaved());
+  // сохраняем id записи в state (чтобы апдейтить followup)
+  setState(userId, { lastFeedbackId: data?.id ?? null });
+
+  // если оценка низкая/средняя — предлагаем уточнение
+  if (avg <= 3) {
+    await sendTypingThen(
+      ctx,
+      `${msg}\n\nЕсли хочешь — уточни в одном сообщении, что именно было не так. Это поможет улучшить быстрее.`,
+      kbAfterSavedWithFollowup()
+    );
+  } else {
+    await sendTypingThen(ctx, msg, kbAfterSaved());
+    resetToMenu(userId);
+  }
+});
+
+bot.action(/^fu:(yes|no)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from.id;
+  const st = state.get(userId);
+
+  if (!st || !st.lastFeedbackId) {
+    resetToMenu(userId);
+    await sendTypingThen(ctx, TEXT.greeting, kbMenu());
+    return;
+  }
+
+  if (ctx.match[1] === "no") {
+    resetToMenu(userId);
+    await sendTypingThen(ctx, "Принято. Спасибо!", kbAfterSaved());
+    return;
+  }
+
+  setState(userId, { step: "WAIT_FOLLOWUP" });
+  await sendTypingThen(ctx, "Напиши уточнение одним сообщением (что именно было не так / что улучшить):", kbBackToMenu());
 });
 
 /* ---------- Vercel handler ---------- */
@@ -331,3 +405,4 @@ export default async function handler(req, res) {
 
   res.status(200).send("ok");
 }
+
