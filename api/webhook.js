@@ -1,3 +1,9 @@
+// api/webhook.js (ПОЛНАЯ рабочая версия)
+// Функции: меню -> текст -> 2 оценки -> сохранение -> финальная отбивка
+// + follow-up при avg<=3 (4.1)
+// + контакт по желанию (5.1): Telegram / Email / Не нужно
+// Таблица: public."mYfeedbek"
+
 import { Telegraf, Markup } from "telegraf";
 import { createClient } from "@supabase/supabase-js";
 import { TEXT, FINAL, TOPIC_LABEL } from "../texts.js";
@@ -13,7 +19,7 @@ const supabase = createClient(
 const state = new Map();
 /**
  * userId -> {
- *   step: "MENU" | "WAIT_TEXT" | "WAIT_USEFULNESS" | "WAIT_USABILITY" | "WAIT_FOLLOWUP",
+ *   step: "MENU" | "WAIT_TEXT" | "WAIT_USEFULNESS" | "WAIT_USABILITY" | "WAIT_FOLLOWUP" | "WAIT_EMAIL",
  *   topic: "REVIEW" | "BUG" | "IDEA" | null,
  *   comment: string|null,
  *   usefulness: number|null,
@@ -36,19 +42,25 @@ function kbBackToMenu() {
   return Markup.inlineKeyboard([[Markup.button.callback("⬅️ В меню", "nav:MENU")]]);
 }
 
-function kbAfterSaved() {
+function kbAfterSavedBase() {
   return Markup.inlineKeyboard([
     [Markup.button.callback("➕ Отправить ещё", "nav:MENU")],
     [Markup.button.callback("✅ Закрыть", "nav:CLOSE")],
   ]);
 }
 
-function kbAfterSavedWithFollowup() {
+function kbFollowupChoice() {
   return Markup.inlineKeyboard([
     [Markup.button.callback("🛠 Уточнить, что не так", "fu:yes")],
     [Markup.button.callback("Нет, спасибо", "fu:no")],
-    [Markup.button.callback("➕ Отправить ещё", "nav:MENU")],
-    [Markup.button.callback("✅ Закрыть", "nav:CLOSE")],
+  ]);
+}
+
+function kbContactChoice() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("📨 Telegram", "ct:TG")],
+    [Markup.button.callback("📧 Email", "ct:EMAIL")],
+    [Markup.button.callback("❌ Не нужно", "ct:NONE")],
   ]);
 }
 
@@ -170,6 +182,13 @@ function buildFinalMessage(topic, comment, usefulness, usability) {
   return `${header}\n\n${ratings}\n\n${tail}${short}`;
 }
 
+function isLikelyEmail(text) {
+  const s = String(text || "").trim();
+  if (s.length < 6 || s.length > 254) return false;
+  // простой и устойчивый regex
+  return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(s);
+}
+
 /* ---------- Flow ---------- */
 
 bot.start(async (ctx) => {
@@ -257,7 +276,37 @@ bot.on("text", async (ctx) => {
   const userId = ctx.from.id;
   const st = state.get(userId);
 
-  // Follow-up text
+  // 1) Email ожидание
+  if (st && st.step === "WAIT_EMAIL" && st.lastFeedbackId) {
+    const email = ctx.message.text.trim();
+
+    if (!isLikelyEmail(email)) {
+      await sendTypingThen(
+        ctx,
+        "Похоже, это не email. Пример: name@example.com\n\nПопробуй ещё раз или нажми «В меню».",
+        kbBackToMenu()
+      );
+      return;
+    }
+
+    const { error } = await supabase
+      .from("mYfeedbek")
+      .update({ contact_type: "EMAIL", contact_value: email })
+      .eq("id", st.lastFeedbackId);
+
+    if (error) {
+      console.error("SUPABASE CONTACT EMAIL UPDATE ERROR:", error);
+      await sendTypingThen(ctx, `Ошибка сохранения (код: ${error.code ?? "unknown"}).`, kbBackToMenu());
+      return;
+    }
+
+    // После email — завершаем
+    resetToMenu(userId);
+    await sendTypingThen(ctx, "Спасибо! Контакт сохранён. Мы можем ответить при необходимости.", kbAfterSavedBase());
+    return;
+  }
+
+  // 2) Follow-up ожидание
   if (st && st.step === "WAIT_FOLLOWUP" && st.lastFeedbackId) {
     const follow = ctx.message.text.trim();
     if (!follow) return;
@@ -273,13 +322,13 @@ bot.on("text", async (ctx) => {
       return;
     }
 
-    // после уточнения — возвращаем в меню
-    resetToMenu(userId);
-    await sendTypingThen(ctx, "Спасибо! Уточнение добавлено.", kbAfterSaved());
+    // После follow-up — предлагаем контакт
+    setState(userId, { step: "MENU" });
+    await sendTypingThen(ctx, "Спасибо! Уточнение добавлено.\n\nОставить контакт для ответа?", kbContactChoice());
     return;
   }
 
-  // Main text
+  // 3) Основной текст
   if (!st || st.step !== "WAIT_TEXT" || !st.topic) return;
 
   const comment = ctx.message.text.trim();
@@ -343,23 +392,29 @@ bot.action(/^usable:(\d)$/, async (ctx) => {
     return;
   }
 
+  const feedbackId = data?.id ?? null;
+  setState(userId, { lastFeedbackId: feedbackId });
+
   const msg = buildFinalMessage(st.topic, st.comment, st.usefulness, usability);
   const avg = scoreAvg(st.usefulness, usability);
 
-  // сохраняем id записи в state (чтобы апдейтить followup)
-  setState(userId, { lastFeedbackId: data?.id ?? null });
+  // 1) Показываем финальную отбивку
+  await sendTypingThen(ctx, msg, { reply_markup: { inline_keyboard: [] } });
 
-  // если оценка низкая/средняя — предлагаем уточнение
+  // 2) Если низко/средне — предлагаем уточнение, потом контакт
   if (avg <= 3) {
+    setState(userId, { step: "MENU" });
     await sendTypingThen(
       ctx,
-      `${msg}\n\nЕсли хочешь — уточни в одном сообщении, что именно было не так. Это поможет улучшить быстрее.`,
-      kbAfterSavedWithFollowup()
+      "Если хочешь — уточни в одном сообщении, что именно было не так. Это поможет улучшить быстрее.",
+      kbFollowupChoice()
     );
-  } else {
-    await sendTypingThen(ctx, msg, kbAfterSaved());
-    resetToMenu(userId);
+    return;
   }
+
+  // 3) Если 4–5 — сразу спрашиваем контакт (по желанию)
+  setState(userId, { step: "MENU" });
+  await sendTypingThen(ctx, "Оставить контакт для ответа (по желанию)?", kbContactChoice());
 });
 
 bot.action(/^fu:(yes|no)$/, async (ctx) => {
@@ -374,13 +429,74 @@ bot.action(/^fu:(yes|no)$/, async (ctx) => {
   }
 
   if (ctx.match[1] === "no") {
-    resetToMenu(userId);
-    await sendTypingThen(ctx, "Принято. Спасибо!", kbAfterSaved());
+    // Если не хочет уточнять — спрашиваем контакт
+    setState(userId, { step: "MENU" });
+    await sendTypingThen(ctx, "Оставить контакт для ответа (по желанию)?", kbContactChoice());
     return;
   }
 
   setState(userId, { step: "WAIT_FOLLOWUP" });
-  await sendTypingThen(ctx, "Напиши уточнение одним сообщением (что именно было не так / что улучшить):", kbBackToMenu());
+  await sendTypingThen(
+    ctx,
+    "Напиши уточнение одним сообщением (что именно было не так / что улучшить):",
+    kbBackToMenu()
+  );
+});
+
+bot.action(/^ct:(TG|EMAIL|NONE)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from.id;
+  const st = state.get(userId);
+
+  if (!st || !st.lastFeedbackId) {
+    resetToMenu(userId);
+    await sendTypingThen(ctx, TEXT.greeting, kbMenu());
+    return;
+  }
+
+  const choice = ctx.match[1];
+
+  if (choice === "NONE") {
+    resetToMenu(userId);
+    await sendTypingThen(ctx, "Принято. Спасибо!", kbAfterSavedBase());
+    return;
+  }
+
+  if (choice === "TG") {
+    const username = ctx.from.username ? `@${ctx.from.username}` : null;
+
+    const { error } = await supabase
+      .from("mYfeedbek")
+      .update({
+        contact_type: "TG",
+        contact_value: username ?? String(userId),
+      })
+      .eq("id", st.lastFeedbackId);
+
+    if (error) {
+      console.error("SUPABASE CONTACT TG UPDATE ERROR:", error);
+      await sendTypingThen(ctx, `Ошибка сохранения (код: ${error.code ?? "unknown"}).`, kbBackToMenu());
+      return;
+    }
+
+    resetToMenu(userId);
+    await sendTypingThen(
+      ctx,
+      username
+        ? `Контакт сохранён: ${username}\nСпасибо!`
+        : "Контакт сохранён. Спасибо!",
+      kbAfterSavedBase()
+    );
+    return;
+  }
+
+  // EMAIL
+  setState(userId, { step: "WAIT_EMAIL" });
+  await sendTypingThen(
+    ctx,
+    "Напиши email одним сообщением (пример: name@example.com).",
+    kbBackToMenu()
+  );
 });
 
 /* ---------- Vercel handler ---------- */
@@ -405,4 +521,3 @@ export default async function handler(req, res) {
 
   res.status(200).send("ok");
 }
-
