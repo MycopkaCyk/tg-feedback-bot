@@ -123,9 +123,18 @@ function calcDelayMs(text) {
   const ms = Math.round(String(text ?? "").length * 12);
   return Math.max(500, Math.min(1300, ms));
 }
-
+// Экранирование HTML для пользовательского ввода (защита от инъекций)
+function escapeHtml(text) {
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
 // Плавная отправка: typing -> "Печатает…" -> пауза -> удалить -> финал
-async function sendTypingThen(ctx, finalText, extra = undefined) {
+// Плавная отправка с поддержкой форматирования
+async function sendTypingThen(ctx, finalText, extra = undefined, parseMode = 'HTML') {
   const safeTyping = TEXT?.typing ?? "Печатает…";
   const safeText = String(finalText ?? "");
 
@@ -147,7 +156,8 @@ async function sendTypingThen(ctx, finalText, extra = undefined) {
     } catch {}
   }
 
-  return ctx.reply(safeText, extra);
+  // Передаём режим форматирования
+  return ctx.reply(safeText, { ...extra, parse_mode: parseMode });
 }
 
 function setState(userId, patch) {
@@ -209,11 +219,9 @@ function buildFinalMessage(topic, comment, usefulness, usability) {
     Array.isArray(pool) && pool.length ? pickRandom(pool) : "Спасибо за обратную связь.";
 
   const short =
-    comment && String(comment).trim().length
-      ? `\n\n📝 Сообщение:\n${String(comment).slice(0, 600)}${
-          String(comment).length > 600 ? "…" : ""
-        }`
-      : "";
+  comment && String(comment).trim().length
+    ? `\n\n📝 Сообщение:\n<code>${escapeHtml(String(comment).slice(0, 600))}${String(comment).length > 600 ? "…" : ""}</code>`
+    : "";
 
   return `${header}\n\n${ratings}\n\n${tail}${short}`;
 }
